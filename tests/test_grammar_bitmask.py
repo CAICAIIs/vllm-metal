@@ -251,19 +251,19 @@ class TestApplyGrammarBitmaskPaged:
             assert np.all(np.isfinite(result[0, row]))
 
     def test_row_span_metadata_masks_verification_rows_and_prefill_tail(self) -> None:
-        """Row-span metadata must mask all verification rows and keep prefill indexing."""
+        """Row-span metadata must mask structured rows while leaving plain spec rows alone."""
         allowed_decode = 7
         allowed_prefill = 15
         decode_reqs = [_make_decode_req("a"), _make_decode_req("b")]
         prefill_reqs = [_make_prefill_req("pf0", 2)]
-        scheduled_spec_decode_tokens = {"a": [101, 102]}
+        scheduled_spec_decode_tokens = {"a": [101, 102], "b": [201]}
         segments = build_paged_decode_segments(
             decode_reqs,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             paged_request_seq_lens={"a": 1, "b": 2},
         )
-        logits = _uniform_logits_3d(6)
-        cu = _build_cu_seqlens(num_decode=4, prefill_lens=[2])
+        logits = _uniform_logits_3d(7)
+        cu = _build_cu_seqlens(num_decode=5, prefill_lens=[2])
         sched = _make_scheduler_output(["a", "b", "pf0"])
         sched.scheduled_spec_decode_tokens = scheduled_spec_decode_tokens
         grammar = _make_grammar_output(
@@ -294,12 +294,12 @@ class TestApplyGrammarBitmaskPaged:
             assert np.isfinite(result[0, row, allowed_decode])
             assert result[0, row, (allowed_decode + 1) % VOCAB_SIZE] == float("-inf")
 
-        # Plain decode row b stays untouched.
-        assert np.all(np.isfinite(result[0, 3]))
+        # Plain speculative decode rows for b stay untouched.
+        np.testing.assert_array_equal(result[0, 3:5], _to_numpy(logits)[0, 3:5])
 
-        # Prefill tail row is indexed after all decode rows (0..3), not after num_decode.
-        assert np.isfinite(result[0, 5, allowed_prefill])
-        assert result[0, 5, (allowed_prefill + 1) % VOCAB_SIZE] == float("-inf")
+        # Prefill tail row is indexed after all decode rows (0..4), not after num_decode.
+        assert np.isfinite(result[0, 6, allowed_prefill])
+        assert result[0, 6, (allowed_prefill + 1) % VOCAB_SIZE] == float("-inf")
 
     def test_row_span_metadata_keeps_request_bitmasks_isolated_by_req_id(self) -> None:
         """Structured-output rows must stay attached to their request IDs."""
