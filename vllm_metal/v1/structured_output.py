@@ -29,7 +29,6 @@ from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
 @dataclass(frozen=True, slots=True)
 class _PagedRowTargets:
-    decode_row_count: int
     req_id_to_rows: dict[str, tuple[int, ...]]
 
 
@@ -87,10 +86,7 @@ def _build_paged_row_targets(
         last_row = cu_seqlens[decode_row_count + j + 1] - 1
         req_id_to_rows[pr.req_id] = (last_row,)
 
-    return _PagedRowTargets(
-        decode_row_count=decode_row_count,
-        req_id_to_rows=req_id_to_rows,
-    )
+    return _PagedRowTargets(req_id_to_rows=req_id_to_rows)
 
 
 def _build_constrained_rows(
@@ -147,12 +143,8 @@ def _build_constrained_rows(
                 f"bitmask rows, needed at least {end_bitmask_row}."
             )
         if rows:
-            constrained.extend(
-                (row, bitmask_index)
-                for row, bitmask_index in zip(
-                    rows, range(bitmask_row, end_bitmask_row), strict=True
-                )
-            )
+            for row_offset, row in enumerate(rows):
+                constrained.append((row, bitmask_row + row_offset))
         bitmask_row = end_bitmask_row
 
     if bitmask_row != grammar_bitmask_row_count:
