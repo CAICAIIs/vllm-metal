@@ -5,7 +5,6 @@ execute_model / sample_tokens."""
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,7 +18,7 @@ from vllm.v1.sample.sampler import Sampler
 import vllm_metal.v1.model_runner as mr
 import vllm_metal.v1.structured_output as so
 from tests.stub_runner import make_stub_runner
-from vllm_metal.v1.spec_decode import PagedDecodeSegment, build_paged_decode_segments
+from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 # Shared instance used by unit tests that call apply_paged directly.
@@ -59,6 +58,7 @@ def _make_scheduler_output(
     """Minimal SchedulerOutput stub — no spec-decode tokens."""
     return SimpleNamespace(
         scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=None,
         num_scheduled_tokens=dict.fromkeys(req_ids, 1),
         total_num_scheduled_tokens=len(req_ids),
         scheduled_new_reqs=[],
@@ -143,34 +143,16 @@ def _build_cu_seqlens(num_decode: int, prefill_lens: list[int]) -> list[int]:
     return cu
 
 
-def _apply_row_span_grammar(
-    grammar: SimpleNamespace,
-    decode_reqs: list[tuple[str, SimpleNamespace]],
-    prefill_reqs: list[SimpleNamespace],
-    cu_seqlens: list[int],
-    num_decode: int,
-    logits: mx.array,
-    segments: Sequence[PagedDecodeSegment],
-) -> mx.array:
-    """Exercise the explicit row-span preparation helper without wiring runtime."""
-    row_targets = so._build_paged_row_targets(
-        decode_reqs,
-        prefill_reqs,
-        cu_seqlens,
-        num_decode,
-        paged_decode_segments=segments,
-    )
-    constrained = so._build_constrained_rows(
-        grammar.structured_output_request_ids,
-        row_targets,
-        grammar_bitmask_row_count=grammar.grammar_bitmask.shape[0],
-        paged_decode_segments=segments,
-    )
-    return so._apply_grammar_bitmask_to_rows(
-        logits,
-        grammar.grammar_bitmask,
-        constrained,
-    )
+def _build_cu_seqlens_from_segment_lengths(
+    decode_lengths: list[int], prefill_lens: list[int]
+) -> list[int]:
+    """Build cu_seqlens for decode row spans plus prefill chunks."""
+    cu = [0]
+    for length in decode_lengths:
+        cu.append(cu[-1] + length)
+    for length in prefill_lens:
+        cu.append(cu[-1] + length)
+    return cu
 
 
 # ---------------------------------------------------------------------------
@@ -288,13 +270,22 @@ class TestApplyGrammarBitmaskPaged:
         decode_reqs = [_make_decode_req("a"), _make_decode_req("b")]
         prefill_reqs = [_make_prefill_req("pf0", 2)]
         scheduled_spec_decode_tokens = {"a": [101, 102], "b": [201]}
-        segments = build_paged_decode_segments(
+        segments = SpeculativeDecodeController().build_decode_segments(
             decode_reqs,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             paged_request_seq_lens={"a": 1, "b": 2},
         )
         logits = _uniform_logits_3d(7)
-        cu = _build_cu_seqlens(num_decode=5, prefill_lens=[2])
+        cu = _build_cu_seqlens_from_segment_lengths(
+            [segment.num_query_tokens for segment in segments],
+            prefill_lens=[2],
+        )
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_scheduled_tokens={"a": 3, "b": 2},
+            total_num_scheduled_tokens=5,
+            finished_req_ids=set(),
+        )
         grammar = _make_grammar_output(
             ["pf0", "a"],
             np.vstack(
@@ -309,14 +300,15 @@ class TestApplyGrammarBitmaskPaged:
         )
 
         result = _to_numpy(
-            _apply_row_span_grammar(
+            _applier.apply_paged(
+                sched,
                 grammar,
                 decode_reqs,
                 prefill_reqs,
                 cu,
-                2,
+                len(segments),
                 logits,
-                segments,
+                decode_segments=segments,
             )
         )
 
@@ -338,13 +330,22 @@ class TestApplyGrammarBitmaskPaged:
         allowed_b_rows = (19, 20)
         decode_reqs = [_make_decode_req("a"), _make_decode_req("b")]
         scheduled_spec_decode_tokens = {"a": [101, 102], "b": [201]}
-        segments = build_paged_decode_segments(
+        segments = SpeculativeDecodeController().build_decode_segments(
             decode_reqs,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             paged_request_seq_lens={"a": 1, "b": 2},
         )
         logits = _uniform_logits_3d(5)
-        cu = _build_cu_seqlens(num_decode=5, prefill_lens=[])
+        cu = _build_cu_seqlens_from_segment_lengths(
+            [segment.num_query_tokens for segment in segments],
+            prefill_lens=[],
+        )
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_scheduled_tokens={"a": 3, "b": 2},
+            total_num_scheduled_tokens=5,
+            finished_req_ids=set(),
+        )
         grammar = _make_grammar_output(
             ["b", "a"],
             np.vstack(
@@ -356,14 +357,15 @@ class TestApplyGrammarBitmaskPaged:
         )
 
         result = _to_numpy(
-            _apply_row_span_grammar(
+            _applier.apply_paged(
+                sched,
                 grammar,
                 decode_reqs,
                 [],
                 cu,
-                2,
+                len(segments),
                 logits,
-                tuple(reversed(segments)),
+                decode_segments=segments,
             )
         )
 
@@ -381,24 +383,34 @@ class TestApplyGrammarBitmaskPaged:
         """A multi-row speculative target must not reuse one request-level bitmask."""
         decode_reqs = [_make_decode_req("a")]
         scheduled_spec_decode_tokens = {"a": [101, 102]}
-        segments = build_paged_decode_segments(
+        segments = SpeculativeDecodeController().build_decode_segments(
             decode_reqs,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             paged_request_seq_lens={"a": 1},
         )
         logits = _uniform_logits_3d(3)
-        cu = _build_cu_seqlens(num_decode=3, prefill_lens=[])
+        cu = _build_cu_seqlens_from_segment_lengths(
+            [segment.num_query_tokens for segment in segments],
+            prefill_lens=[],
+        )
+        sched = SimpleNamespace(
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_scheduled_tokens={"a": 3},
+            total_num_scheduled_tokens=3,
+            finished_req_ids=set(),
+        )
         grammar = _make_grammar_output(["a"], _make_single_token_bitmask(7))
 
         with pytest.raises(NotImplementedError, match="one grammar bitmask row"):
-            _apply_row_span_grammar(
+            _applier.apply_paged(
+                sched,
                 grammar,
                 decode_reqs,
                 [],
                 cu,
-                1,
+                len(segments),
                 logits,
-                segments,
+                decode_segments=segments,
             )
 
     def test_no_constrained_requests_returns_unchanged_logits(self) -> None:
@@ -733,7 +745,18 @@ class TestSampleTokensGrammarPagedPath:
             scheduler_output=scheduler_output,
             logits=logits,
             cu_seqlens=[0, 1],
-            num_decode=1,
+            decode_segments=(
+                mr.PagedDecodeSegment(
+                    req_id="r0",
+                    input_token_ids=(1,),
+                    start_row=0,
+                    num_query_tokens=1,
+                    draft_token_ids=(),
+                    cache_start_pos=0,
+                    block_ids=(),
+                ),
+            ),
+            num_decode_tokens=1,
         )
 
         output = runner.sample_tokens(grammar_output=grammar_output)
