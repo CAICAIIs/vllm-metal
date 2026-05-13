@@ -914,6 +914,7 @@ class MetalModelRunner:
                 cu_seqlens,
                 num_decode_segments,
                 logits,
+                decode_segments=decode_segments,
             )
 
         # ---- sample tokens ----

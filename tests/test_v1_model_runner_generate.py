@@ -179,8 +179,18 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         req_ids: list[str],
         allowed_token_id: int,
     ) -> SimpleNamespace:
-        bitmask = np.zeros((len(req_ids), 1), dtype=np.int32)
-        for row in range(len(req_ids)):
+        return self._make_grammar_rows(
+            req_ids,
+            [allowed_token_id for _ in req_ids],
+        )
+
+    def _make_grammar_rows(
+        self,
+        req_ids: list[str],
+        allowed_token_ids: list[int],
+    ) -> SimpleNamespace:
+        bitmask = np.zeros((len(allowed_token_ids), 1), dtype=np.int32)
+        for row, allowed_token_id in enumerate(allowed_token_ids):
             bitmask[row, 0] = 1 << allowed_token_id
         return SimpleNamespace(
             structured_output_request_ids=req_ids,
@@ -513,7 +523,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert draft_state.token_ids == [1, 6, 7, 9]
         assert structured_state.token_ids == [2, 3, 5]
 
-    def test_structured_output_rejects_same_request_spec_decode(self) -> None:
+    def test_structured_output_masks_same_request_spec_decode_rows(self) -> None:
         runner = self._make_runner()
         req_state = self._make_state([1, 6])
         decode_reqs = [("r0", req_state)]
@@ -534,14 +544,17 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             runner,
             decode_reqs,
             (segment,),
-            self._make_logits([7, 9]),
+            self._make_logits([0, 0]),
             scheduler_output,
         )
 
-        with pytest.raises(NotImplementedError, match="speculative decoding"):
-            runner.sample_tokens(grammar_output=self._make_grammar_output(["r0"], 5))
+        output = runner.sample_tokens(
+            grammar_output=self._make_grammar_rows(["r0"], [7, 9]),
+        )
 
-        assert req_state.token_ids == [1, 6]
+        assert output is not None
+        assert output.sampled_token_ids == [[7, 9]]
+        assert req_state.token_ids == [1, 6, 7, 9]
 
     def test_rejects_non_greedy_spec_decode_verification(self) -> None:
         runner = self._make_runner()
