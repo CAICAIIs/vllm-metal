@@ -253,12 +253,6 @@ class MetalStructuredOutputApplier:
         if not constrained:
             return logits
 
-        if xgr is None:
-            raise RuntimeError(
-                "xgrammar is required for structured output. "
-                "Install it with: pip install xgrammar"
-            )
-
         # --- CPU/xgrammar bridge: operate only on constrained rows ---
         #
         # Copy only the n_constrained rows (not total_tokens) to CPU float32.
