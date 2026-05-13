@@ -185,7 +185,12 @@ class MetalStructuredOutputApplier:
         grammar_bitmask_row_count: int,
         consume_row_spans: bool,
     ) -> list[tuple[int, int]]:
-        """Pair target logits rows with grammar bitmask rows."""
+        """Pair target logits rows with grammar bitmask rows.
+
+        With row-span consumption, vLLM emits contiguous grammar bitmask rows
+        in structured_output_request_ids order: speculative draft rows first,
+        then the bonus/non-speculative row for the same request.
+        """
         if not consume_row_spans:
             constrained: list[tuple[int, int]] = []
             for bitmask_row, req_id in enumerate(structured_output_request_ids):
