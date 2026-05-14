@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import mlx.core as mx
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -13,6 +13,17 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 
 from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
+
+if TYPE_CHECKING:
+    from vllm.config.speculative import SpeculativeConfig
+
+# Raw Gemma4 assistant checkpoints use the HF/Transformers identifiers;
+# upstream vLLM maps them to the Gemma4MTP wrapper identifiers during config
+# normalization. Accept both so this gate works before and after that mapping.
+_GEMMA4_MTP_DRAFT_MODEL_TYPES = frozenset({"gemma4_assistant", "gemma4_mtp"})
+_GEMMA4_MTP_DRAFT_ARCHITECTURES = frozenset(
+    {"Gemma4AssistantForCausalLM", "Gemma4MTPModel"}
+)
 
 
 class _PagedDecodeStateLike(Protocol):
@@ -182,6 +193,44 @@ class SpeculativeDecodeController:
             start_row += segment.num_query_tokens
 
         return tuple(segments)
+
+    def needs_target_hidden_states(
+        self,
+        decode_segments: Sequence[PagedDecodeSegment],
+        *,
+        has_final_prefill: bool = False,
+        speculative_config: SpeculativeConfig | None = None,
+    ) -> bool:
+        """Return whether target hidden states are needed for draft follow-up.
+
+        Gemma4 MTP needs the previous target step's hidden states even for
+        plain decode or final prefill rows, because the assistant consumes
+        those rows to draft the next tokens.
+        """
+        if not decode_segments and not has_final_prefill:
+            return False
+        return self._uses_gemma4_mtp(speculative_config)
+
+    @staticmethod
+    def _uses_gemma4_mtp(speculative_config: SpeculativeConfig | None) -> bool:
+        if speculative_config is None or speculative_config.method != "mtp":
+            return False
+
+        draft_model_config = speculative_config.draft_model_config
+        if draft_model_config is None:
+            return False
+
+        hf_config = draft_model_config.hf_config
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type in _GEMMA4_MTP_DRAFT_MODEL_TYPES:
+            return True
+
+        # Architectures may be absent, None, or already rewritten by upstream
+        # vLLM, so normalize this optional HF field defensively.
+        architectures = getattr(hf_config, "architectures", ()) or ()
+        if isinstance(architectures, str):
+            architectures = (architectures,)
+        return any(arch in _GEMMA4_MTP_DRAFT_ARCHITECTURES for arch in architectures)
 
     def verify_greedy(
         self,
